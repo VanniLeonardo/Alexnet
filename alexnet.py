@@ -13,6 +13,8 @@ class AlexNet:
     - Local Response Normalization (LRN) after pool1 and pool2
     - 3 Fully connected layers with dropout
     - Softmax output for 1000 classes
+    - Grouped convolutions in conv2, conv4, and conv5 (2 groups each)
+      to replicate the original dual-GPU architecture
     """
     
     def __init__(self, num_classes: int = 1000, dropout_prob: float = 0.5):
@@ -38,20 +40,23 @@ class AlexNet:
         self.conv1_W = np.random.normal(0, 0.01, (96, 3, 11, 11))
         self.conv1_b = np.zeros(96)
         
-        # Conv2: 5x5x96x256, stride=1, pad=2
-        self.conv2_W = np.random.normal(0, 0.01, (256, 96, 5, 5))
+        # Conv2: 5x5x48x256 (grouped, 2 groups), stride=1, pad=2
+        # Each group: 5x5x48x128, total output channels: 256
+        self.conv2_W = np.random.normal(0, 0.01, (256, 48, 5, 5))
         self.conv2_b = np.ones(256)
         
-        # Conv3: 3x3x256x384, stride=1, pad=1
+        # Conv3: 3x3x256x384, stride=1, pad=1 (fully connected)
         self.conv3_W = np.random.normal(0, 0.01, (384, 256, 3, 3))
         self.conv3_b = np.zeros(384)
         
-        # Conv4: 3x3x384x384, stride=1, pad=1
-        self.conv4_W = np.random.normal(0, 0.01, (384, 384, 3, 3))
+        # Conv4: 3x3x192x384 (grouped, 2 groups), stride=1, pad=1
+        # Each group: 3x3x192x192, total output channels: 384
+        self.conv4_W = np.random.normal(0, 0.01, (384, 192, 3, 3))
         self.conv4_b = np.ones(384)
         
-        # Conv5: 3x3x384x256, stride=1, pad=1
-        self.conv5_W = np.random.normal(0, 0.01, (256, 384, 3, 3))
+        # Conv5: 3x3x192x256 (grouped, 2 groups), stride=1, pad=1
+        # Each group: 3x3x192x128, total output channels: 256
+        self.conv5_W = np.random.normal(0, 0.01, (256, 192, 3, 3))
         self.conv5_b = np.zeros(256)
         
         # FC1: 9216 -> 4096 (6*6*256 = 9216)
@@ -109,6 +114,126 @@ class AlexNet:
                         ) + b[c_out]
         
         return out
+    
+    def _grouped_conv2d(self, x: np.ndarray, W: np.ndarray, b: np.ndarray, 
+                       groups: int = 2, stride: int = 1, pad: int = 0) -> np.ndarray:
+        """
+        Args:
+            x: Input tensor (N, C_in, H, W)
+            W: Weight tensor (C_out, C_in//groups, KH, KW)
+            b: Bias tensor (C_out,)
+            groups: Number of groups for grouped convolution
+            stride: Convolution stride
+            pad: Padding size
+            
+        Returns:
+            Output tensor (N, C_out, H_out, W_out)
+        """
+        N, C_in, H_in, W_in = x.shape
+        C_out, C_in_per_group, KH, KW = W.shape
+        
+        assert C_in % groups == 0, f"Input channels {C_in} not divisible by groups {groups}"
+        assert C_out % groups == 0, f"Output channels {C_out} not divisible by groups {groups}"
+        
+        C_in_per_group_actual = C_in // groups
+        C_out_per_group = C_out // groups
+        
+        x_padded = self._pad_input(x, pad)
+        
+        H_out = (H_in + 2 * pad - KH) // stride + 1
+        W_out = (W_in + 2 * pad - KW) // stride + 1
+        
+        out = np.zeros((N, C_out, H_out, W_out))
+        
+        # Process each group separately
+        for g in range(groups):
+
+            x_group = x_padded[:, g * C_in_per_group_actual:(g + 1) * C_in_per_group_actual, :, :]
+            
+            W_group = W[g * C_out_per_group:(g + 1) * C_out_per_group, :, :, :]
+            
+            b_group = b[g * C_out_per_group:(g + 1) * C_out_per_group]
+            
+            # Perform convolution for this group
+            for n in range(N):
+                for c_out in range(C_out_per_group):
+                    for h in range(H_out):
+                        for w in range(W_out):
+                            h_start = h * stride
+                            h_end = h_start + KH
+                            w_start = w * stride
+                            w_end = w_start + KW
+                            
+                            # Calculate global output channel index
+                            global_c_out = g * C_out_per_group + c_out
+                            
+                            out[n, global_c_out, h, w] = np.sum(
+                                x_group[n, :, h_start:h_end, w_start:w_end] * W_group[c_out]
+                            ) + b_group[c_out]
+        
+        return out
+    
+    def _grouped_conv2d_backward(self, dout: np.ndarray, x: np.ndarray, W: np.ndarray, 
+                                groups: int = 2, stride: int = 1, pad: int = 0) -> tuple:
+        """
+        Args:
+            dout: Gradient from next layer (N, C_out, H_out, W_out)
+            x: Input tensor from forward pass (N, C_in, H, W)
+            W: Weight tensor (C_out, C_in//groups, KH, KW)
+            groups: Number of groups
+            stride: Convolution stride
+            pad: Padding size
+            
+        Returns:
+            Tuple of (dx, dW, db)
+        """
+        N, C_in, H_in, W_in = x.shape
+        N, C_out, H_out, W_out = dout.shape
+        C_out_tensor, C_in_per_group, KH, KW = W.shape
+        
+        C_in_per_group_actual = C_in // groups
+        C_out_per_group = C_out // groups
+        
+        x_padded = self._pad_input(x, pad)
+        
+        dx_padded = np.zeros_like(x_padded)
+        dW = np.zeros_like(W)
+        db = np.zeros(C_out)
+        
+        for g in range(groups):
+            x_group = x_padded[:, g * C_in_per_group_actual:(g + 1) * C_in_per_group_actual, :, :]
+            
+            dout_group = dout[:, g * C_out_per_group:(g + 1) * C_out_per_group, :, :]
+            dx_group = dx_padded[:, g * C_in_per_group_actual:(g + 1) * C_in_per_group_actual, :, :]
+            dW_group = dW[g * C_out_per_group:(g + 1) * C_out_per_group, :, :, :]
+            db_group = db[g * C_out_per_group:(g + 1) * C_out_per_group]
+            
+            # Compute gradients for this group
+            for n in range(N):
+                for c_out in range(C_out_per_group):
+                    for h in range(H_out):
+                        for w in range(W_out):
+                            h_start = h * stride
+                            h_end = h_start + KH
+                            w_start = w * stride
+                            w_end = w_start + KW
+                            
+                            dx_group[n, :, h_start:h_end, w_start:w_end] += (
+                                dout_group[n, c_out, h, w] * W[g * C_out_per_group + c_out, :, :, :]
+                            )
+                            
+                            dW_group[c_out, :, :, :] += (
+                                dout_group[n, c_out, h, w] * x_group[n, :, h_start:h_end, w_start:w_end]
+                            )
+                            
+                            db_group[c_out] += dout_group[n, c_out, h, w]
+        
+        if pad > 0:
+            dx = dx_padded[:, :, pad:-pad, pad:-pad]
+        else:
+            dx = dx_padded
+            
+        return dx, dW, db
     
     def _relu(self, x: np.ndarray) -> np.ndarray:
         return np.maximum(0, x)
@@ -234,9 +359,8 @@ class AlexNet:
         print(f"LRN1 shape: {lrn1.shape}")
         
         # Conv Layer 2: 27x27x96 -> 27x27x256
-        # 5x5 conv, stride 1, padding 2
-        # Note: In original AlexNet, this is grouped convolution, simplified here
-        conv2 = self._conv2d(lrn1, self.conv2_W, self.conv2_b, stride=1, pad=2)
+        # 5x5 conv, stride 1, padding 2, GROUPED (2 groups)
+        conv2 = self._grouped_conv2d(lrn1, self.conv2_W, self.conv2_b, groups=2, stride=1, pad=2)
         conv2_relu = self._relu(conv2)
         print(f"Conv2 + ReLU shape: {conv2_relu.shape}")
         
@@ -250,22 +374,20 @@ class AlexNet:
         print(f"LRN2 shape: {lrn2.shape}")
         
         # Conv Layer 3: 13x13x256 -> 13x13x384
-        # 3x3 conv, stride 1, padding 1
+        # 3x3 conv, stride 1, padding 1, FULLY CONNECTED (not grouped)
         conv3 = self._conv2d(lrn2, self.conv3_W, self.conv3_b, stride=1, pad=1)
         conv3_relu = self._relu(conv3)
         print(f"Conv3 + ReLU shape: {conv3_relu.shape}")
         
         # Conv Layer 4: 13x13x384 -> 13x13x384
-        # 3x3 conv, stride 1, padding 1
-        # Note: Grouped convolution simplified
-        conv4 = self._conv2d(conv3_relu, self.conv4_W, self.conv4_b, stride=1, pad=1)
+        # 3x3 conv, stride 1, padding 1, GROUPED (2 groups)
+        conv4 = self._grouped_conv2d(conv3_relu, self.conv4_W, self.conv4_b, groups=2, stride=1, pad=1)
         conv4_relu = self._relu(conv4)
         print(f"Conv4 + ReLU shape: {conv4_relu.shape}")
         
         # Conv Layer 5: 13x13x384 -> 13x13x256
-        # 3x3 conv, stride 1, padding 1
-        # Note: Grouped convolution simplified
-        conv5 = self._conv2d(conv4_relu, self.conv5_W, self.conv5_b, stride=1, pad=1)
+        # 3x3 conv, stride 1, padding 1, GROUPED (2 groups)
+        conv5 = self._grouped_conv2d(conv4_relu, self.conv5_W, self.conv5_b, groups=2, stride=1, pad=1)
         conv5_relu = self._relu(conv5)
         print(f"Conv5 + ReLU shape: {conv5_relu.shape}")
         
@@ -473,7 +595,56 @@ def demo_alexnet():
     
     print(f"\nTotal parameters: {total_params:,}")
     print(f"Model size (approx): {total_params * 4 / (1024**2):.1f} MB (float32)")
+    
+    print("Parameter comparison (Grouped vs. Non-grouped):")
+    
+    # Conv2: grouped vs non-grouped
+    conv2_grouped_params = 256 * 48 * 5 * 5 + 256  # 2 groups of 128 filters × 48 channels each
+    conv2_normal_params = 256 * 96 * 5 * 5 + 256   # 256 filters × 96 channels
+    print(f"Conv2: {conv2_grouped_params:,} (grouped) vs {conv2_normal_params:,} (normal) - {conv2_grouped_params/conv2_normal_params:.1%} reduction")
+    
+    # Conv4: grouped vs non-grouped  
+    conv4_grouped_params = 384 * 192 * 3 * 3 + 384  # 2 groups of 192 filters × 192 channels each
+    conv4_normal_params = 384 * 384 * 3 * 3 + 384   # 384 filters × 384 channels
+    print(f"Conv4: {conv4_grouped_params:,} (grouped) vs {conv4_normal_params:,} (normal) - {conv4_grouped_params/conv4_normal_params:.1%} reduction")
+    
+    # Conv5: grouped vs non-grouped
+    conv5_grouped_params = 256 * 192 * 3 * 3 + 256  # 2 groups of 128 filters × 192 channels each
+    conv5_normal_params = 256 * 384 * 3 * 3 + 256   # 256 filters × 384 channels  
+    print(f"Conv5: {conv5_grouped_params:,} (grouped) vs {conv5_normal_params:,} (normal) - {conv5_grouped_params/conv5_normal_params:.1%} reduction")
+    
+    total_grouped = conv2_grouped_params + conv4_grouped_params + conv5_grouped_params
+    total_normal = conv2_normal_params + conv4_normal_params + conv5_normal_params
+    print(f"\nTotal conv params: {total_grouped:,} (grouped) vs {total_normal:,} (normal)")
+    print(f"Overall reduction: {total_grouped/total_normal:.1%} of normal parameters")
+
+
+def compare_grouped_vs_normal_conv():
+
+    np.random.seed(123)
+    x = np.random.randn(1, 4, 8, 8)
+    
+    print(f"Input shape: {x.shape}")
+    
+    W_normal = np.random.randn(8, 4, 3, 3) * 0.1
+    b_normal = np.zeros(8)
+    
+    W_grouped = np.random.randn(8, 2, 3, 3) * 0.1
+    b_grouped = np.zeros(8)
+    
+    net = AlexNet()
+    
+    out_normal = net._conv2d(x, W_normal, b_normal, stride=1, pad=1)
+    print(f"Normal conv output shape: {out_normal.shape}")
+    print(f"Normal conv parameters: {W_normal.size + b_normal.size}")
+    
+    out_grouped = net._grouped_conv2d(x, W_grouped, b_grouped, groups=2, stride=1, pad=1)
+    print(f"Grouped conv output shape: {out_grouped.shape}")
+    print(f"Grouped conv parameters: {W_grouped.size + b_grouped.size}")
+    
+    print(f"\nParameter reduction: {(W_grouped.size + b_grouped.size) / (W_normal.size + b_normal.size):.1%}")
 
 
 if __name__ == "__main__":
     demo_alexnet()
+    compare_grouped_vs_normal_conv()
